@@ -1,0 +1,61 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, Segoe UI, Roboto, sans-serif;
+  background: #0b1020;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  width: 100%;
+  height: 100%;
+}
+
+.panel-shell {
+  border-right: 1px solid #2a3455;
+  background: #101833;
+  padding: 16px;
+}
+
+.field-shell {
+  position: relative;
+  background: #0a122b;
+  padding: 12px;
+}
+
+.control-panel h2 {
+  margin: 0 0 10px;
+  font-size: 18px;
+}
+
+.control-panel p {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #c9d4ff;
+}
+
+.status-line {
+  margin-top: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.field-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: 8px;
+  border: 1px solid #2a3455;
+}
+
