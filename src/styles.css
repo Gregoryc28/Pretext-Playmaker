@@ -46,6 +46,13 @@ body,
   color: #c9d4ff;
 }
 
+.control-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
 .status-line {
   margin-top: 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
