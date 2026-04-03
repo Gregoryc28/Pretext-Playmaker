@@ -18,7 +18,7 @@ export function FieldView(): JSX.Element {
 
     return () => {
       window.removeEventListener('resize', onResize);
-      renderer.stop();
+      renderer.destroy();
     };
   }, []);
 

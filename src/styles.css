@@ -51,6 +51,16 @@ body,
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+.spotlight-status {
+  margin: 6px 0 12px;
+  padding: 8px 10px;
+  border: 1px solid #2f4977;
+  border-radius: 8px;
+  background: rgba(34, 57, 92, 0.42);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #d6e6ff;
+}
+
 .field-canvas {
   width: 100%;
   height: 100%;
