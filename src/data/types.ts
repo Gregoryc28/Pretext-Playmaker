@@ -1,4 +1,5 @@
 export type TeamSide = 'home' | 'away';
+export type TrackingTeam = TeamSide | 'football';
 
 export interface Vector2 {
   x: number;
@@ -26,6 +27,35 @@ export interface PlayerTrackingSample {
 export interface TrackingFrame {
   meta: TrackingMeta;
   players: PlayerTrackingSample[];
+}
+
+export interface PlayEntitySample {
+  entityId: string;
+  displayName: string;
+  team: TrackingTeam;
+  x: number;
+  y: number;
+  s: number;
+  dir: number;
+}
+
+export interface PlayFrame {
+  frameId: number;
+  timestampMs: number;
+  entities: PlayEntitySample[];
+}
+
+export interface PlayMeta {
+  gameId: string;
+  playId: string;
+  frameRateHz: number;
+  source: string;
+  description?: string;
+}
+
+export interface PlayData {
+  meta: PlayMeta;
+  frames: PlayFrame[];
 }
 
 export interface FieldDimensions {

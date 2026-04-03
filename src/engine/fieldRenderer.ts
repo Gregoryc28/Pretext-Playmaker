@@ -1,10 +1,12 @@
 import { scaleLinear } from 'd3-scale';
-import { createMockPlayers, stepMockPlayers, type MockPlayerState } from '../data/mockTracking';
-import type { FieldDimensions } from '../data/types';
+import { fetchPlayData } from '../data/trackingService';
+import type { FieldDimensions, PlayData, PlayEntitySample } from '../data/types';
 import { placeLabels } from '../physics/labelPlacement';
+import { computeTeamConvexHull, computeVoronoiCells, type TeamPoint } from '../physics/mathUtils';
 import type { CircleObstacle, Rect } from '../physics/spatialGrid';
 import { runtimeBus } from './events';
 import { GameLoop } from './gameLoop';
+import { getLoopedPlayTimeSeconds, samplePlayAtTime, type InterpolatedFrame } from './interpolator';
 import { measureTextBlock, type TextMeasureResult } from './pretextAdapter';
 
 const FIELD_DIMENSIONS: FieldDimensions = {
@@ -14,6 +16,15 @@ const FIELD_DIMENSIONS: FieldDimensions = {
 
 const FONT = '600 13px Inter';
 const LINE_HEIGHT = 16;
+const PLAYER_RADIUS_PX = 8;
+const FOOTBALL_RADIUS_PX = 5;
+const YARDS_PER_SECOND_TO_MPH = 2.045;
+
+interface ProjectedPlayer extends TeamPoint {
+  player: PlayEntitySample;
+  velocityPxX: number;
+  velocityPxY: number;
+}
 
 interface CachedLabel {
   text: string;
@@ -39,8 +50,9 @@ export class FieldRenderer {
   private readonly context: CanvasRenderingContext2D;
   private readonly loop: GameLoop;
   private readonly labels = new Map<string, CachedLabel>();
-  private readonly players = createMockPlayers(FIELD_DIMENSIONS);
-  private frameCounter = 0;
+  private playData: PlayData | null = null;
+  private currentFrame: InterpolatedFrame | null = null;
+  private playTimeSeconds = 0;
   private fpsFrameCount = 0;
   private fpsWindowStart = performance.now();
 
@@ -56,6 +68,7 @@ export class FieldRenderer {
       update: this.update,
       render: this.render,
     });
+    void this.loadPlayData();
     this.resize();
   }
 
@@ -79,8 +92,13 @@ export class FieldRenderer {
   }
 
   private update = (fixedDeltaSeconds: number): void => {
-    stepMockPlayers(this.players, fixedDeltaSeconds, FIELD_DIMENSIONS);
-    this.frameCounter += 1;
+    if (!this.playData) {
+      return;
+    }
+
+    this.playTimeSeconds += fixedDeltaSeconds;
+    const loopedTime = getLoopedPlayTimeSeconds(this.playData, this.playTimeSeconds);
+    this.currentFrame = samplePlayAtTime(this.playData, loopedTime);
   };
 
   private render = (): void => {
@@ -92,6 +110,19 @@ export class FieldRenderer {
     const xScale = scaleLinear().domain([0, FIELD_DIMENSIONS.lengthYards]).range([fieldRect.x, fieldRect.x + fieldRect.width]);
     const yScale = scaleLinear().domain([0, FIELD_DIMENSIONS.widthYards]).range([fieldRect.y, fieldRect.y + fieldRect.height]);
 
+    ctx.clearRect(0, 0, width, height);
+    this.drawField(ctx, fieldRect, xScale);
+
+    const frame = this.currentFrame;
+    if (!frame) {
+      ctx.fillStyle = '#e8f0ff';
+      ctx.font = '600 16px Inter';
+      ctx.fillText('Loading play data...', fieldRect.x + 16, fieldRect.y + 28);
+      return;
+    }
+
+    const projectedPlayers: ProjectedPlayer[] = [];
+    const footballs: Array<{ entity: PlayEntitySample; x: number; y: number }> = [];
     const obstacles: CircleObstacle[] = [];
     const labelRequests = [] as {
       playerId: string;
@@ -102,26 +133,46 @@ export class FieldRenderer {
       height: number;
     }[];
 
-    for (const player of this.players) {
-      const px = xScale(player.location.x);
-      const py = yScale(player.location.y);
-      const radiusPx = 8;
-      const text = `${player.displayName}\n${player.speedMph.toFixed(1)} mph`;
-      const measured = measureTextBlock(text, FONT, 136, LINE_HEIGHT);
-      this.labels.set(player.playerId, { text, measured });
+    for (const player of frame.entities) {
+      const px = xScale(player.x);
+      const py = yScale(player.y);
 
-      obstacles.push({
-        id: player.playerId,
+      if (player.team === 'football') {
+        footballs.push({ entity: player, x: px, y: py });
+        continue;
+      }
+
+      const headingRadians = (player.dir * Math.PI) / 180;
+      const velocityYardsX = player.s * Math.sin(headingRadians);
+      const velocityYardsY = player.s * Math.cos(headingRadians);
+      const projectedPx = xScale(player.x + velocityYardsX);
+      const projectedPy = yScale(player.y + velocityYardsY);
+      const text = `${player.displayName}\n${(player.s * YARDS_PER_SECOND_TO_MPH).toFixed(1)} mph`;
+      const measured = measureTextBlock(text, FONT, 136, LINE_HEIGHT);
+      this.labels.set(player.entityId, { text, measured });
+
+      projectedPlayers.push({
+        player,
+        playerId: player.entityId,
+        team: player.team,
         x: px,
         y: py,
-        radius: radiusPx,
+        velocityPxX: projectedPx - px,
+        velocityPxY: projectedPy - py,
+      });
+
+      obstacles.push({
+        id: player.entityId,
+        x: px,
+        y: py,
+        radius: PLAYER_RADIUS_PX,
       });
 
       labelRequests.push({
-        playerId: player.playerId,
+        playerId: player.entityId,
         playerX: px,
         playerY: py,
-        playerRadius: radiusPx,
+        playerRadius: PLAYER_RADIUS_PX,
         width: measured.width + 12,
         height: measured.height + 8,
       });
@@ -129,13 +180,25 @@ export class FieldRenderer {
 
     const placements = placeLabels(labelRequests, obstacles, fieldRect, 4);
 
-    ctx.clearRect(0, 0, width, height);
-    this.drawField(ctx, fieldRect, xScale);
+    this.drawPitchControl(ctx, projectedPlayers, fieldRect);
+    this.drawDefensiveShell(ctx, projectedPlayers);
 
-    for (const player of this.players) {
-      this.drawPlayer(ctx, player, xScale, yScale);
-      const placement = placements.get(player.playerId);
-      const label = this.labels.get(player.playerId);
+    for (const projectedPlayer of projectedPlayers) {
+      this.drawEntity(ctx, projectedPlayer.player, projectedPlayer.x, projectedPlayer.y);
+    }
+
+    for (const football of footballs) {
+      this.drawEntity(ctx, football.entity, football.x, football.y);
+    }
+
+    for (const projectedPlayer of projectedPlayers) {
+      this.drawVelocityVector(ctx, projectedPlayer);
+    }
+
+    for (const projectedPlayer of projectedPlayers) {
+      const player = projectedPlayer.player;
+      const placement = placements.get(player.entityId);
+      const label = this.labels.get(player.entityId);
 
       if (!placement || !placement.visible || !label) {
         continue;
@@ -199,22 +262,97 @@ export class FieldRenderer {
     ctx.stroke();
   }
 
-  private drawPlayer(
-    ctx: CanvasRenderingContext2D,
-    player: MockPlayerState,
-    xScale: (value: number) => number,
-    yScale: (value: number) => number,
-  ): void {
-    const x = xScale(player.location.x);
-    const y = yScale(player.location.y);
+  private drawPitchControl(ctx: CanvasRenderingContext2D, players: ProjectedPlayer[], fieldRect: Rect): void {
+    const cells = computeVoronoiCells(players, fieldRect);
+
+    for (const cell of cells) {
+      if (cell.polygon.length < 3) {
+        continue;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(cell.polygon[0][0], cell.polygon[0][1]);
+      for (let pointIndex = 1; pointIndex < cell.polygon.length; pointIndex += 1) {
+        ctx.lineTo(cell.polygon[pointIndex][0], cell.polygon[pointIndex][1]);
+      }
+      ctx.closePath();
+      ctx.fillStyle = cell.point.team === 'home' ? 'rgba(79, 179, 255, 0.08)' : 'rgba(255, 127, 139, 0.08)';
+      ctx.fill();
+      ctx.strokeStyle = cell.point.team === 'home' ? 'rgba(79, 179, 255, 0.14)' : 'rgba(255, 127, 139, 0.14)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
+  private drawDefensiveShell(ctx: CanvasRenderingContext2D, players: ProjectedPlayer[]): void {
+    const hull = computeTeamConvexHull(players, 'away');
+    if (!hull || hull.length < 3) {
+      return;
+    }
 
     ctx.beginPath();
-    ctx.arc(x, y, 8, 0, Math.PI * 2);
-    ctx.fillStyle = player.team === 'home' ? '#4fb3ff' : '#ff7f8b';
+    ctx.moveTo(hull[0][0], hull[0][1]);
+    for (let index = 1; index < hull.length; index += 1) {
+      ctx.lineTo(hull[index][0], hull[index][1]);
+    }
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255, 70, 88, 0.12)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 97, 114, 0.85)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  private drawEntity(ctx: CanvasRenderingContext2D, entity: PlayEntitySample, x: number, y: number): void {
+    const radius = entity.team === 'football' ? FOOTBALL_RADIUS_PX : PLAYER_RADIUS_PX;
+    const fillStyle = entity.team === 'home' ? '#4fb3ff' : entity.team === 'away' ? '#ff7f8b' : '#b4844d';
+
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = fillStyle;
     ctx.fill();
     ctx.strokeStyle = '#0b1020';
     ctx.lineWidth = 2;
     ctx.stroke();
+  }
+
+  private drawVelocityVector(ctx: CanvasRenderingContext2D, projectedPlayer: ProjectedPlayer): void {
+    const startX = projectedPlayer.x;
+    const startY = projectedPlayer.y;
+    const endX = projectedPlayer.x + projectedPlayer.velocityPxX;
+    const endY = projectedPlayer.y + projectedPlayer.velocityPxY;
+    const vectorLength = Math.hypot(projectedPlayer.velocityPxX, projectedPlayer.velocityPxY);
+
+    if (vectorLength < 1) {
+      return;
+    }
+
+    ctx.strokeStyle = projectedPlayer.team === 'home' ? 'rgba(180, 224, 255, 0.85)' : 'rgba(255, 210, 215, 0.85)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(startX, startY);
+    ctx.lineTo(endX, endY);
+    ctx.stroke();
+
+    const arrowSize = Math.max(5, Math.min(8, vectorLength * 0.2));
+    const angle = Math.atan2(projectedPlayer.velocityPxY, projectedPlayer.velocityPxX);
+
+    ctx.beginPath();
+    ctx.moveTo(endX, endY);
+    ctx.lineTo(endX - arrowSize * Math.cos(angle - Math.PI / 7), endY - arrowSize * Math.sin(angle - Math.PI / 7));
+    ctx.lineTo(endX - arrowSize * Math.cos(angle + Math.PI / 7), endY - arrowSize * Math.sin(angle + Math.PI / 7));
+    ctx.closePath();
+    ctx.fillStyle = projectedPlayer.team === 'home' ? 'rgba(180, 224, 255, 0.9)' : 'rgba(255, 210, 215, 0.9)';
+    ctx.fill();
+  }
+
+  private async loadPlayData(): Promise<void> {
+    try {
+      this.playData = await fetchPlayData();
+      this.currentFrame = samplePlayAtTime(this.playData, 0);
+    } catch (error) {
+      console.error('Failed to load sample play data.', error);
+    }
   }
 }
 
