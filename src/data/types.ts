@@ -53,9 +53,23 @@ export interface PlayMeta {
   description?: string;
 }
 
+export type PlayActionEventType = 'pass-thrown' | 'pass-complete' | 'pass-incomplete' | 'tackle' | 'generic';
+
+export type PlayActionEventSource = 'dataset' | 'inferred';
+
+export interface PlayActionEvent {
+  id: string;
+  type: PlayActionEventType;
+  source: PlayActionEventSource;
+  timestampMs: number;
+  label: string;
+  durationMs?: number;
+}
+
 export interface PlayData {
   meta: PlayMeta;
   frames: PlayFrame[];
+  events?: PlayActionEvent[];
 }
 
 export interface FieldDimensions {

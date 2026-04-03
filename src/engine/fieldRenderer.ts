@@ -1,7 +1,7 @@
 import { scaleLinear } from 'd3-scale';
 import { polygonArea, polygonCentroid } from 'd3-polygon';
 import { fetchPlayData } from '../data/trackingService';
-import type { FieldDimensions, PlayData, PlayEntitySample } from '../data/types';
+import type { FieldDimensions, PlayActionEvent, PlayData, PlayEntitySample } from '../data/types';
 import { placeLabels } from '../physics/labelPlacement';
 import { computeTeamConvexHull, computeVoronoiCells, type TeamPoint } from '../physics/mathUtils';
 import type { CircleObstacle, Rect } from '../physics/spatialGrid';
@@ -35,6 +35,12 @@ interface CachedLabel {
   measured: TextMeasureResult;
 }
 
+interface ActiveFootballEvent {
+  id: string;
+  text: string;
+  expiresAtMs: number;
+}
+
 function drawRoundedRect(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number): void {
   ctx.beginPath();
   ctx.moveTo(x + radius, y);
@@ -62,6 +68,7 @@ export class FieldRenderer {
   private mousePositionPx: { x: number; y: number } | null = null;
   private readonly lastSpeedByPlayer = new Map<string, number>();
   private readonly accelerationByPlayer = new Map<string, number>();
+  private readonly activeFootballEvents: ActiveFootballEvent[] = [];
   private fpsFrameCount = 0;
   private fpsWindowStart = performance.now();
 
@@ -115,6 +122,8 @@ export class FieldRenderer {
 
     const { isPlaying, playTimeSeconds: storeTimeSeconds } = usePlayStore.getState();
 
+    const previousPlayTimeSeconds = this.playTimeSeconds;
+
     if (isPlaying) {
       this.playTimeSeconds = getLoopedPlayTimeSeconds(this.playData, this.playTimeSeconds + fixedDeltaSeconds);
       usePlayStore.setState({ playTimeSeconds: this.playTimeSeconds });
@@ -122,6 +131,8 @@ export class FieldRenderer {
       this.playTimeSeconds = Math.max(0, Math.min(storeTimeSeconds, this.playDurationSeconds));
     }
 
+    this.triggerCrossedPlayEvents(previousPlayTimeSeconds, this.playTimeSeconds);
+    this.pruneExpiredFootballEvents();
     this.currentFrame = samplePlayAtTime(this.playData, this.playTimeSeconds);
     this.updateDerivedMotionMetrics(this.currentFrame, fixedDeltaSeconds);
     this.updateHoveredPlayer(this.currentFrame);
@@ -271,6 +282,11 @@ export class FieldRenderer {
       this.drawEntity(ctx, football.entity, football.x, football.y);
     }
 
+    const footballAnchor = footballs[0];
+    if (footballAnchor) {
+      this.drawActiveFootballEvents(ctx, footballAnchor.x, footballAnchor.y);
+    }
+
     for (const projectedPlayer of projectedPlayers) {
       this.drawVelocityVector(ctx, projectedPlayer);
     }
@@ -393,6 +409,86 @@ export class FieldRenderer {
     }
 
     return 'In';
+  }
+
+  private triggerCrossedPlayEvents(previousTimeSeconds: number, currentTimeSeconds: number): void {
+    if (!this.playData || !this.playData.events || this.playData.events.length === 0) {
+      return;
+    }
+
+    const durationMs = this.playDurationSeconds * 1000;
+    const previousTimeMs = previousTimeSeconds * 1000;
+    const currentTimeMs = currentTimeSeconds * 1000;
+    for (const event of this.playData.events) {
+      if (!this.didCrossTimestamp(previousTimeMs, currentTimeMs, event.timestampMs, durationMs)) {
+        continue;
+      }
+
+      const now = performance.now();
+      const existing = this.activeFootballEvents.find((activeEvent) => activeEvent.id === event.id);
+      if (existing) {
+        existing.expiresAtMs = now + (event.durationMs ?? 1500);
+        existing.text = event.label;
+        continue;
+      }
+
+      this.activeFootballEvents.push({
+        id: event.id,
+        text: event.label,
+        expiresAtMs: now + (event.durationMs ?? 1500),
+      });
+    }
+  }
+
+  private didCrossTimestamp(previousMs: number, currentMs: number, targetMs: number, durationMs: number): boolean {
+    if (durationMs <= 0) {
+      return currentMs >= targetMs && previousMs < targetMs;
+    }
+
+    const normalizedTarget = ((targetMs % durationMs) + durationMs) % durationMs;
+    const normalizedPrevious = ((previousMs % durationMs) + durationMs) % durationMs;
+    const normalizedCurrent = ((currentMs % durationMs) + durationMs) % durationMs;
+
+    if (normalizedPrevious <= normalizedCurrent) {
+      return normalizedTarget > normalizedPrevious && normalizedTarget <= normalizedCurrent;
+    }
+
+    return normalizedTarget > normalizedPrevious || normalizedTarget <= normalizedCurrent;
+  }
+
+  private pruneExpiredFootballEvents(): void {
+    const now = performance.now();
+    for (let index = this.activeFootballEvents.length - 1; index >= 0; index -= 1) {
+      if (this.activeFootballEvents[index].expiresAtMs <= now) {
+        this.activeFootballEvents.splice(index, 1);
+      }
+    }
+  }
+
+  private drawActiveFootballEvents(ctx: CanvasRenderingContext2D, footballX: number, footballY: number): void {
+    for (let index = 0; index < this.activeFootballEvents.length; index += 1) {
+      const event = this.activeFootballEvents[index];
+      const measured = measureTextBlock(event.text, '600 12px Inter', 200, 14);
+      const boxWidth = measured.width + 12;
+      const boxHeight = measured.height + 8;
+      const boxX = footballX + 14;
+      const boxY = footballY - boxHeight - 10 - index * (boxHeight + 6);
+
+      drawRoundedRect(ctx, boxX, boxY, boxWidth, boxHeight, 6);
+      ctx.fillStyle = 'rgba(14, 24, 54, 0.92)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(110, 176, 255, 0.65)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.font = '600 12px Inter';
+      ctx.fillStyle = '#e8f0ff';
+      let lineY = boxY + 14;
+      for (const line of measured.lines) {
+        ctx.fillText(line.text, boxX + 6, lineY);
+        lineY += 14;
+      }
+    }
   }
 
   private drawPitchControl(
@@ -541,6 +637,7 @@ export class FieldRenderer {
       usePlayStore.getState().setPlayDuration(this.playDurationSeconds);
       usePlayStore.getState().setPlayMeta(this.playData.meta);
       usePlayStore.setState({ playTimeSeconds: 0 });
+      this.activeFootballEvents.length = 0;
 
       this.currentFrame = samplePlayAtTime(this.playData, 0);
     } catch (error) {
