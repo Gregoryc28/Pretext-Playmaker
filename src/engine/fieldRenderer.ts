@@ -20,6 +20,7 @@ const LINE_HEIGHT = 16;
 const PLAYER_RADIUS_PX = 8;
 const FOOTBALL_RADIUS_PX = 5;
 const YARDS_PER_SECOND_TO_MPH = 2.045;
+const HOVER_DISTANCE_YARDS = 1.25;
 
 interface ProjectedPlayer extends TeamPoint {
   player: PlayEntitySample;
@@ -55,6 +56,10 @@ export class FieldRenderer {
   private currentFrame: InterpolatedFrame | null = null;
   private playTimeSeconds = 0;
   private playDurationSeconds = 0;
+  private hoveredPlayerId: string | null = null;
+  private mousePositionPx: { x: number; y: number } | null = null;
+  private readonly lastSpeedByPlayer = new Map<string, number>();
+  private readonly accelerationByPlayer = new Map<string, number>();
   private fpsFrameCount = 0;
   private fpsWindowStart = performance.now();
 
@@ -70,6 +75,8 @@ export class FieldRenderer {
       update: this.update,
       render: this.render,
     });
+    this.canvas.addEventListener('mousemove', this.handleMouseMove);
+    this.canvas.addEventListener('mouseleave', this.handleMouseLeave);
     void this.loadPlayData();
     this.resize();
   }
@@ -80,6 +87,12 @@ export class FieldRenderer {
 
   stop(): void {
     this.loop.stop();
+  }
+
+  destroy(): void {
+    this.stop();
+    this.canvas.removeEventListener('mousemove', this.handleMouseMove);
+    this.canvas.removeEventListener('mouseleave', this.handleMouseLeave);
   }
 
   resize(): void {
@@ -108,16 +121,68 @@ export class FieldRenderer {
     }
 
     this.currentFrame = samplePlayAtTime(this.playData, this.playTimeSeconds);
+    this.updateDerivedMotionMetrics(this.currentFrame, fixedDeltaSeconds);
+    this.updateHoveredPlayer(this.currentFrame);
   };
+
+  private handleMouseMove = (event: MouseEvent): void => {
+    const rect = this.canvas.getBoundingClientRect();
+    this.mousePositionPx = {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+    };
+  };
+
+  private handleMouseLeave = (): void => {
+    this.mousePositionPx = null;
+    this.hoveredPlayerId = null;
+  };
+
+  private updateDerivedMotionMetrics(frame: InterpolatedFrame, fixedDeltaSeconds: number): void {
+    for (const entity of frame.entities) {
+      if (entity.team === 'football') {
+        continue;
+      }
+
+      const previousSpeed = this.lastSpeedByPlayer.get(entity.entityId) ?? entity.s;
+      const accelYardsPerSecondSq = fixedDeltaSeconds > 0 ? (entity.s - previousSpeed) / fixedDeltaSeconds : 0;
+      this.accelerationByPlayer.set(entity.entityId, accelYardsPerSecondSq * YARDS_PER_SECOND_TO_MPH);
+      this.lastSpeedByPlayer.set(entity.entityId, entity.s);
+    }
+  }
+
+  private updateHoveredPlayer(frame: InterpolatedFrame): void {
+    const mouse = this.mousePositionPx;
+    if (!mouse) {
+      this.hoveredPlayerId = null;
+      return;
+    }
+
+    const { xScale, yScale } = this.getFieldLayout();
+    const mouseFieldX = xScale.invert(mouse.x);
+    const mouseFieldY = yScale.invert(mouse.y);
+
+    let bestPlayerId: string | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const entity of frame.entities) {
+      if (entity.team === 'football') {
+        continue;
+      }
+
+      const distanceYards = Math.hypot(entity.x - mouseFieldX, entity.y - mouseFieldY);
+      if (distanceYards <= HOVER_DISTANCE_YARDS && distanceYards < bestDistance) {
+        bestDistance = distanceYards;
+        bestPlayerId = entity.entityId;
+      }
+    }
+
+    this.hoveredPlayerId = bestPlayerId;
+  }
 
   private render = (): void => {
     const ctx = this.context;
-    const width = this.canvas.clientWidth;
-    const height = this.canvas.clientHeight;
-    const fieldRect: Rect = { x: 24, y: 24, width: width - 48, height: height - 48 };
-
-    const xScale = scaleLinear().domain([0, FIELD_DIMENSIONS.lengthYards]).range([fieldRect.x, fieldRect.x + fieldRect.width]);
-    const yScale = scaleLinear().domain([0, FIELD_DIMENSIONS.widthYards]).range([fieldRect.y, fieldRect.y + fieldRect.height]);
+    const { width, height, fieldRect, xScale, yScale } = this.getFieldLayout();
 
     ctx.clearRect(0, 0, width, height);
     this.drawField(ctx, fieldRect, xScale);
@@ -132,6 +197,7 @@ export class FieldRenderer {
 
     const projectedPlayers: ProjectedPlayer[] = [];
     const footballs: Array<{ entity: PlayEntitySample; x: number; y: number }> = [];
+    const footballEntity = frame.entities.find((entity) => entity.team === 'football') ?? null;
     const obstacles: CircleObstacle[] = [];
     const labelRequests = [] as {
       playerId: string;
@@ -156,8 +222,11 @@ export class FieldRenderer {
       const velocityYardsY = player.s * Math.cos(headingRadians);
       const projectedPx = xScale(player.x + velocityYardsX);
       const projectedPy = yScale(player.y + velocityYardsY);
-      const text = `${player.displayName}\n${(player.s * YARDS_PER_SECOND_TO_MPH).toFixed(1)} mph`;
-      const measured = measureTextBlock(text, FONT, 136, LINE_HEIGHT);
+      const isHoveredPlayer = this.hoveredPlayerId === player.entityId;
+      const text = isHoveredPlayer
+        ? this.buildHoveredLabelText(player, footballEntity)
+        : `${player.displayName}\n${(player.s * YARDS_PER_SECOND_TO_MPH).toFixed(1)} mph`;
+      const measured = measureTextBlock(text, FONT, isHoveredPlayer ? 220 : 136, LINE_HEIGHT);
       this.labels.set(player.entityId, { text, measured });
 
       projectedPlayers.push({
@@ -269,6 +338,59 @@ export class FieldRenderer {
     ctx.moveTo(midfieldX, fieldRect.y);
     ctx.lineTo(midfieldX, fieldRect.y + fieldRect.height);
     ctx.stroke();
+  }
+
+  private getFieldLayout(): {
+    width: number;
+    height: number;
+    fieldRect: Rect;
+    xScale: ReturnType<typeof scaleLinear<number, number>>;
+    yScale: ReturnType<typeof scaleLinear<number, number>>;
+  } {
+    const width = this.canvas.clientWidth;
+    const height = this.canvas.clientHeight;
+    const fieldRect: Rect = { x: 24, y: 24, width: width - 48, height: height - 48 };
+    const xScale = scaleLinear<number, number>().domain([0, FIELD_DIMENSIONS.lengthYards]).range([fieldRect.x, fieldRect.x + fieldRect.width]);
+    const yScale = scaleLinear<number, number>().domain([0, FIELD_DIMENSIONS.widthYards]).range([fieldRect.y, fieldRect.y + fieldRect.height]);
+    return { width, height, fieldRect, xScale, yScale };
+  }
+
+  private buildHoveredLabelText(player: PlayEntitySample, footballEntity: PlayEntitySample | null): string {
+    const speedMph = player.s * YARDS_PER_SECOND_TO_MPH;
+    const accelerationMphPerSecond = this.accelerationByPlayer.get(player.entityId) ?? 0;
+    const distanceToFootballYards = footballEntity ? Math.hypot(player.x - footballEntity.x, player.y - footballEntity.y) : 0;
+    const routeType = this.classifyRouteType(player.dir, player.s);
+    const expectedPoints = ((player.x - 60) / 20 + 1.8).toFixed(2);
+
+    return [
+      player.displayName,
+      `Speed: ${speedMph.toFixed(1)} mph`,
+      `Acceleration: ${accelerationMphPerSecond.toFixed(2)} mph/s`,
+      `Distance to Football: ${distanceToFootballYards.toFixed(1)} yds`,
+      `Route Type: ${routeType}`,
+      `Expected Points: ${expectedPoints}`,
+    ].join('\n');
+  }
+
+  private classifyRouteType(directionDegrees: number, speedYardsPerSecond: number): string {
+    if (speedYardsPerSecond < 0.8) {
+      return 'Settle';
+    }
+
+    const normalized = ((directionDegrees % 360) + 360) % 360;
+    if (normalized < 45 || normalized >= 315) {
+      return 'Go';
+    }
+
+    if (normalized < 135) {
+      return 'Out';
+    }
+
+    if (normalized < 225) {
+      return 'Comeback';
+    }
+
+    return 'In';
   }
 
   private drawPitchControl(ctx: CanvasRenderingContext2D, players: ProjectedPlayer[], fieldRect: Rect): void {
