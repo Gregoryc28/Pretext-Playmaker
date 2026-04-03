@@ -23,6 +23,7 @@ const FOOTBALL_RADIUS_PX = 5;
 const YARDS_PER_SECOND_TO_MPH = 2.045;
 const HOVER_DISTANCE_YARDS = 1.25;
 const VORONOI_TEXT_LINE_HEIGHT = 13;
+const SPOTLIGHT_CLICK_RADIUS_YARDS = 1.8;
 
 interface ProjectedPlayer extends TeamPoint {
   player: PlayEntitySample;
@@ -39,6 +40,12 @@ interface ActiveFootballEvent {
   id: string;
   text: string;
   expiresAtMs: number;
+}
+
+interface SpotlightMatchup {
+  offensive: PlayEntitySample;
+  defensive: PlayEntitySample;
+  separationYards: number;
 }
 
 function drawRoundedRect(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number): void {
@@ -69,6 +76,8 @@ export class FieldRenderer {
   private readonly lastSpeedByPlayer = new Map<string, number>();
   private readonly accelerationByPlayer = new Map<string, number>();
   private readonly activeFootballEvents: ActiveFootballEvent[] = [];
+  private spotlightPlayerId: string | null = null;
+  private spotlightDefenderId: string | null = null;
   private fpsFrameCount = 0;
   private fpsWindowStart = performance.now();
 
@@ -86,6 +95,7 @@ export class FieldRenderer {
     });
     this.canvas.addEventListener('mousemove', this.handleMouseMove);
     this.canvas.addEventListener('mouseleave', this.handleMouseLeave);
+    this.canvas.addEventListener('click', this.handleCanvasClick);
     void this.loadPlayData();
     this.resize();
   }
@@ -102,6 +112,7 @@ export class FieldRenderer {
     this.stop();
     this.canvas.removeEventListener('mousemove', this.handleMouseMove);
     this.canvas.removeEventListener('mouseleave', this.handleMouseLeave);
+    this.canvas.removeEventListener('click', this.handleCanvasClick);
   }
 
   resize(): void {
@@ -136,6 +147,8 @@ export class FieldRenderer {
     this.currentFrame = samplePlayAtTime(this.playData, this.playTimeSeconds);
     this.updateDerivedMotionMetrics(this.currentFrame, fixedDeltaSeconds);
     this.updateHoveredPlayer(this.currentFrame);
+    this.updateSpotlightDefender(this.currentFrame);
+    this.publishSpotlightMatchup(this.currentFrame);
   };
 
   private handleMouseMove = (event: MouseEvent): void => {
@@ -149,6 +162,51 @@ export class FieldRenderer {
   private handleMouseLeave = (): void => {
     this.mousePositionPx = null;
     this.hoveredPlayerId = null;
+  };
+
+  private handleCanvasClick = (event: MouseEvent): void => {
+    const frame = this.currentFrame;
+    if (!frame) {
+      return;
+    }
+
+    const rect = this.canvas.getBoundingClientRect();
+    const mousePxX = event.clientX - rect.left;
+    const mousePxY = event.clientY - rect.top;
+    const { xScale, yScale } = this.getFieldLayout();
+    const mouseFieldX = xScale.invert(mousePxX);
+    const mouseFieldY = yScale.invert(mousePxY);
+
+    let selectedOffensive: PlayEntitySample | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const entity of frame.entities) {
+      if (!this.isOffensivePlayer(entity)) {
+        continue;
+      }
+
+      const distanceYards = Math.hypot(entity.x - mouseFieldX, entity.y - mouseFieldY);
+      if (distanceYards <= SPOTLIGHT_CLICK_RADIUS_YARDS && distanceYards < bestDistance) {
+        selectedOffensive = entity;
+        bestDistance = distanceYards;
+      }
+    }
+
+    if (!selectedOffensive) {
+      this.spotlightPlayerId = null;
+      this.spotlightDefenderId = null;
+      usePlayStore.getState().setSpotlightMatchup(null);
+      return;
+    }
+
+    if (this.spotlightPlayerId === selectedOffensive.entityId) {
+      this.spotlightPlayerId = null;
+      this.spotlightDefenderId = null;
+      usePlayStore.getState().setSpotlightMatchup(null);
+      return;
+    }
+
+    this.spotlightPlayerId = selectedOffensive.entityId;
   };
 
   private updateDerivedMotionMetrics(frame: InterpolatedFrame, fixedDeltaSeconds: number): void {
@@ -193,6 +251,51 @@ export class FieldRenderer {
     this.hoveredPlayerId = bestPlayerId;
   }
 
+  private updateSpotlightDefender(frame: InterpolatedFrame): void {
+    if (!this.spotlightPlayerId) {
+      this.spotlightDefenderId = null;
+      return;
+    }
+
+    const offensive = frame.entities.find((entity) => entity.entityId === this.spotlightPlayerId && this.isOffensivePlayer(entity));
+    if (!offensive) {
+      this.spotlightPlayerId = null;
+      this.spotlightDefenderId = null;
+      return;
+    }
+
+    const defensive = this.findNearestDefender(frame, offensive);
+    this.spotlightDefenderId = defensive?.entityId ?? null;
+  }
+
+  private publishSpotlightMatchup(frame: InterpolatedFrame): void {
+    const matchup = this.getSpotlightMatchup(frame);
+    const { spotlightMatchup } = usePlayStore.getState();
+
+    if (!matchup) {
+      if (spotlightMatchup) {
+        usePlayStore.getState().setSpotlightMatchup(null);
+      }
+      return;
+    }
+
+    const nextSeparation = Number(matchup.separationYards.toFixed(1));
+    if (
+      spotlightMatchup &&
+      spotlightMatchup.offensivePlayerId === matchup.offensive.entityId &&
+      spotlightMatchup.defensivePlayerId === matchup.defensive.entityId &&
+      spotlightMatchup.separationYards === nextSeparation
+    ) {
+      return;
+    }
+
+    usePlayStore.getState().setSpotlightMatchup({
+      offensivePlayerId: matchup.offensive.entityId,
+      defensivePlayerId: matchup.defensive.entityId,
+      separationYards: nextSeparation,
+    });
+  }
+
   private render = (): void => {
     const ctx = this.context;
     const { width, height, fieldRect, xScale, yScale } = this.getFieldLayout();
@@ -211,6 +314,7 @@ export class FieldRenderer {
     const projectedPlayers: ProjectedPlayer[] = [];
     const footballs: Array<{ entity: PlayEntitySample; x: number; y: number }> = [];
     const footballEntity = frame.entities.find((entity) => entity.team === 'football') ?? null;
+    const spotlightMatchup = this.getSpotlightMatchup(frame);
     const obstacles: CircleObstacle[] = [];
     const labelRequests = [] as {
       playerId: string;
@@ -274,12 +378,20 @@ export class FieldRenderer {
     this.drawPitchControl(ctx, projectedPlayers, fieldRect, xScale, yScale);
     this.drawDefensiveShell(ctx, projectedPlayers);
 
+    if (spotlightMatchup) {
+      ctx.fillStyle = 'rgba(8, 16, 37, 0.2)';
+      ctx.fillRect(fieldRect.x, fieldRect.y, fieldRect.width, fieldRect.height);
+    }
+
     for (const projectedPlayer of projectedPlayers) {
-      this.drawEntity(ctx, projectedPlayer.player, projectedPlayer.x, projectedPlayer.y);
+      const isSpotlightPair =
+        spotlightMatchup &&
+        (projectedPlayer.player.entityId === spotlightMatchup.offensive.entityId || projectedPlayer.player.entityId === spotlightMatchup.defensive.entityId);
+      this.drawEntity(ctx, projectedPlayer.player, projectedPlayer.x, projectedPlayer.y, isSpotlightPair ? 1 : spotlightMatchup ? 0.35 : 1, Boolean(isSpotlightPair));
     }
 
     for (const football of footballs) {
-      this.drawEntity(ctx, football.entity, football.x, football.y);
+      this.drawEntity(ctx, football.entity, football.x, football.y, spotlightMatchup ? 0.65 : 1);
     }
 
     const footballAnchor = footballs[0];
@@ -287,8 +399,15 @@ export class FieldRenderer {
       this.drawActiveFootballEvents(ctx, footballAnchor.x, footballAnchor.y);
     }
 
+    if (spotlightMatchup) {
+      this.drawSpotlightTether(ctx, spotlightMatchup, xScale, yScale);
+    }
+
     for (const projectedPlayer of projectedPlayers) {
-      this.drawVelocityVector(ctx, projectedPlayer);
+      const isSpotlightPair =
+        spotlightMatchup &&
+        (projectedPlayer.player.entityId === spotlightMatchup.offensive.entityId || projectedPlayer.player.entityId === spotlightMatchup.defensive.entityId);
+      this.drawVelocityVector(ctx, projectedPlayer, isSpotlightPair ? 1 : spotlightMatchup ? 0.25 : 1);
     }
 
     for (const projectedPlayer of projectedPlayers) {
@@ -298,6 +417,15 @@ export class FieldRenderer {
 
       if (!placement || !placement.visible || !label) {
         continue;
+      }
+
+      const isSpotlightLabel =
+        spotlightMatchup &&
+        (player.entityId === spotlightMatchup.offensive.entityId || player.entityId === spotlightMatchup.defensive.entityId);
+
+      ctx.save();
+      if (spotlightMatchup && !isSpotlightLabel) {
+        ctx.globalAlpha = 0.35;
       }
 
       ctx.strokeStyle = 'rgba(219, 233, 255, 0.5)';
@@ -320,6 +448,8 @@ export class FieldRenderer {
         ctx.fillText(line.text, placement.x + 6, lineY);
         lineY += LINE_HEIGHT;
       }
+
+      ctx.restore();
     }
 
     this.fpsFrameCount += 1;
@@ -409,6 +539,94 @@ export class FieldRenderer {
     }
 
     return 'In';
+  }
+
+  private isOffensivePlayer(entity: PlayEntitySample): boolean {
+    return entity.team === 'home';
+  }
+
+  private isDefensivePlayer(entity: PlayEntitySample): boolean {
+    return entity.team === 'away';
+  }
+
+  private findNearestDefender(frame: InterpolatedFrame, offensive: PlayEntitySample): PlayEntitySample | null {
+    let bestDefender: PlayEntitySample | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const entity of frame.entities) {
+      if (!this.isDefensivePlayer(entity)) {
+        continue;
+      }
+
+      const distanceYards = Math.hypot(entity.x - offensive.x, entity.y - offensive.y);
+      if (distanceYards < bestDistance) {
+        bestDistance = distanceYards;
+        bestDefender = entity;
+      }
+    }
+
+    return bestDefender;
+  }
+
+  private getSpotlightMatchup(frame: InterpolatedFrame): SpotlightMatchup | null {
+    if (!this.spotlightPlayerId || !this.spotlightDefenderId) {
+      return null;
+    }
+
+    const offensive = frame.entities.find((entity) => entity.entityId === this.spotlightPlayerId && this.isOffensivePlayer(entity));
+    const defensive = frame.entities.find((entity) => entity.entityId === this.spotlightDefenderId && this.isDefensivePlayer(entity));
+    if (!offensive || !defensive) {
+      return null;
+    }
+
+    return {
+      offensive,
+      defensive,
+      separationYards: Math.hypot(offensive.x - defensive.x, offensive.y - defensive.y),
+    };
+  }
+
+  private drawSpotlightTether(
+    ctx: CanvasRenderingContext2D,
+    matchup: SpotlightMatchup,
+    xScale: ReturnType<typeof scaleLinear<number, number>>,
+    yScale: ReturnType<typeof scaleLinear<number, number>>,
+  ): void {
+    const startX = xScale(matchup.offensive.x);
+    const startY = yScale(matchup.offensive.y);
+    const endX = xScale(matchup.defensive.x);
+    const endY = yScale(matchup.defensive.y);
+    const midX = (startX + endX) / 2;
+    const midY = (startY + endY) / 2;
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(123, 201, 255, 0.9)';
+    ctx.shadowBlur = 10;
+    ctx.strokeStyle = 'rgba(146, 214, 255, 0.95)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(startX, startY);
+    ctx.lineTo(endX, endY);
+    ctx.stroke();
+    ctx.restore();
+
+    const separationLabel = `${matchup.separationYards.toFixed(1)} yds`;
+    const measured = measureTextBlock(separationLabel, '700 12px Inter', 120, 14);
+    const boxWidth = measured.width + 14;
+    const boxHeight = measured.height + 8;
+    const boxX = midX - boxWidth / 2;
+    const boxY = midY - boxHeight / 2;
+
+    drawRoundedRect(ctx, boxX, boxY, boxWidth, boxHeight, 6);
+    ctx.fillStyle = 'rgba(10, 24, 52, 0.92)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(140, 206, 255, 0.95)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.font = '700 12px Inter';
+    ctx.fillStyle = '#e8f0ff';
+    ctx.fillText(separationLabel, boxX + 7, boxY + 14);
   }
 
   private triggerCrossedPlayEvents(previousTimeSeconds: number, currentTimeSeconds: number): void {
@@ -583,9 +801,19 @@ export class FieldRenderer {
     ctx.stroke();
   }
 
-  private drawEntity(ctx: CanvasRenderingContext2D, entity: PlayEntitySample, x: number, y: number): void {
+  private drawEntity(
+    ctx: CanvasRenderingContext2D,
+    entity: PlayEntitySample,
+    x: number,
+    y: number,
+    opacity: number = 1,
+    highlight: boolean = false,
+  ): void {
     const radius = entity.team === 'football' ? FOOTBALL_RADIUS_PX : PLAYER_RADIUS_PX;
     const fillStyle = entity.team === 'home' ? '#4fb3ff' : entity.team === 'away' ? '#ff7f8b' : '#b4844d';
+
+    ctx.save();
+    ctx.globalAlpha = opacity;
 
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);
@@ -594,9 +822,19 @@ export class FieldRenderer {
     ctx.strokeStyle = '#0b1020';
     ctx.lineWidth = 2;
     ctx.stroke();
+
+    if (highlight && entity.team !== 'football') {
+      ctx.beginPath();
+      ctx.arc(x, y, radius + 4, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(173, 226, 255, 0.95)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    ctx.restore();
   }
 
-  private drawVelocityVector(ctx: CanvasRenderingContext2D, projectedPlayer: ProjectedPlayer): void {
+  private drawVelocityVector(ctx: CanvasRenderingContext2D, projectedPlayer: ProjectedPlayer, opacity: number = 1): void {
     const startX = projectedPlayer.x;
     const startY = projectedPlayer.y;
     const endX = projectedPlayer.x + projectedPlayer.velocityPxX;
@@ -607,6 +845,8 @@ export class FieldRenderer {
       return;
     }
 
+    ctx.save();
+    ctx.globalAlpha = opacity;
     ctx.strokeStyle = projectedPlayer.team === 'home' ? 'rgba(180, 224, 255, 0.85)' : 'rgba(255, 210, 215, 0.85)';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
@@ -624,6 +864,7 @@ export class FieldRenderer {
     ctx.closePath();
     ctx.fillStyle = projectedPlayer.team === 'home' ? 'rgba(180, 224, 255, 0.9)' : 'rgba(255, 210, 215, 0.9)';
     ctx.fill();
+    ctx.restore();
   }
 
   private async loadPlayData(): Promise<void> {
@@ -637,7 +878,10 @@ export class FieldRenderer {
       usePlayStore.getState().setPlayDuration(this.playDurationSeconds);
       usePlayStore.getState().setPlayMeta(this.playData.meta);
       usePlayStore.setState({ playTimeSeconds: 0 });
+      usePlayStore.getState().setSpotlightMatchup(null);
       this.activeFootballEvents.length = 0;
+      this.spotlightPlayerId = null;
+      this.spotlightDefenderId = null;
 
       this.currentFrame = samplePlayAtTime(this.playData, 0);
     } catch (error) {

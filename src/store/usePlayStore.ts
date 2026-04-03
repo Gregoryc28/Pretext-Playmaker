@@ -1,15 +1,23 @@
 import { create } from 'zustand';
 import type { PlayMeta } from '../data/types';
 
+export interface SpotlightMatchupState {
+  offensivePlayerId: string;
+  defensivePlayerId: string;
+  separationYards: number;
+}
+
 interface PlayStoreState {
   isPlaying: boolean;
   playTimeSeconds: number;
   playDurationSeconds: number;
   playMeta: PlayMeta | null;
+  spotlightMatchup: SpotlightMatchupState | null;
   togglePlayback: () => void;
   setPlayTime: (seconds: number) => void;
   setPlayDuration: (seconds: number) => void;
   setPlayMeta: (meta: PlayMeta | null) => void;
+  setSpotlightMatchup: (matchup: SpotlightMatchupState | null) => void;
 }
 
 function clampToNonNegative(value: number): number {
@@ -21,6 +29,7 @@ export const usePlayStore = create<PlayStoreState>((set, get) => ({
   playTimeSeconds: 0,
   playDurationSeconds: 0,
   playMeta: null,
+  spotlightMatchup: null,
   togglePlayback: () => {
     set((state) => ({ isPlaying: !state.isPlaying }));
   },
@@ -38,6 +47,9 @@ export const usePlayStore = create<PlayStoreState>((set, get) => ({
   },
   setPlayMeta: (meta: PlayMeta | null) => {
     set({ playMeta: meta });
+  },
+  setSpotlightMatchup: (matchup: SpotlightMatchupState | null) => {
+    set({ spotlightMatchup: matchup });
   },
 }));
 
