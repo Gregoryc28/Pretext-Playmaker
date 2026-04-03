@@ -9,11 +9,16 @@ export interface SpotlightMatchupState {
 
 interface PlayStoreState {
   isPlaying: boolean;
+  isDrawMode: boolean;
   playTimeSeconds: number;
   playDurationSeconds: number;
+  telestratorResetVersion: number;
   playMeta: PlayMeta | null;
   spotlightMatchup: SpotlightMatchupState | null;
   togglePlayback: () => void;
+  toggleDrawMode: () => void;
+  setDrawMode: (enabled: boolean) => void;
+  resetTelestrator: () => void;
   setPlayTime: (seconds: number) => void;
   setPlayDuration: (seconds: number) => void;
   setPlayMeta: (meta: PlayMeta | null) => void;
@@ -26,12 +31,23 @@ function clampToNonNegative(value: number): number {
 
 export const usePlayStore = create<PlayStoreState>((set, get) => ({
   isPlaying: true,
+  isDrawMode: false,
   playTimeSeconds: 0,
   playDurationSeconds: 0,
+  telestratorResetVersion: 0,
   playMeta: null,
   spotlightMatchup: null,
   togglePlayback: () => {
     set((state) => ({ isPlaying: !state.isPlaying }));
+  },
+  toggleDrawMode: () => {
+    set((state) => ({ isDrawMode: !state.isDrawMode }));
+  },
+  setDrawMode: (enabled: boolean) => {
+    set({ isDrawMode: enabled });
+  },
+  resetTelestrator: () => {
+    set((state) => ({ telestratorResetVersion: state.telestratorResetVersion + 1 }));
   },
   setPlayTime: (seconds: number) => {
     const duration = get().playDurationSeconds;

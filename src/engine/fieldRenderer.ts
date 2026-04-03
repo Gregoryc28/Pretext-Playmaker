@@ -27,6 +27,7 @@ const SPOTLIGHT_CLICK_RADIUS_YARDS = 1.8;
 const GHOST_TRAIL_DURATION_SECONDS = 1.5;
 const GHOST_TRAIL_MIN_SAMPLE_DELTA_SECONDS = 1 / 240;
 const PEAK_SPEED_LOCK_EPSILON_YARDS_PER_SECOND = 0.03;
+const TELESTRATOR_MIN_POINT_DELTA_YARDS = 0.05;
 
 interface ProjectedPlayer extends TeamPoint {
   player: PlayEntitySample;
@@ -63,6 +64,11 @@ interface PeakVelocityMarker {
   speedMph: number;
 }
 
+interface TelestratorPoint {
+  x: number;
+  y: number;
+}
+
 function drawRoundedRect(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number): void {
   ctx.beginPath();
   ctx.moveTo(x + radius, y);
@@ -94,6 +100,11 @@ export class FieldRenderer {
   private readonly peakSpeedTargetByPlayer = new Map<string, number>();
   private readonly peakVelocityMarkerByPlayer = new Map<string, PeakVelocityMarker>();
   private readonly activeFootballEvents: ActiveFootballEvent[] = [];
+  private isDrawingTelestratorPath = false;
+  private telestratorPathYards: TelestratorPoint[] = [];
+  private telestratorDistanceYards = 0;
+  private telestratorCursorYards: TelestratorPoint | null = null;
+  private lastTelestratorResetVersion = 0;
   private spotlightPlayerId: string | null = null;
   private spotlightDefenderId: string | null = null;
   private fpsFrameCount = 0;
@@ -114,6 +125,10 @@ export class FieldRenderer {
     this.canvas.addEventListener('mousemove', this.handleMouseMove);
     this.canvas.addEventListener('mouseleave', this.handleMouseLeave);
     this.canvas.addEventListener('click', this.handleCanvasClick);
+    this.canvas.addEventListener('pointerdown', this.handlePointerDown);
+    this.canvas.addEventListener('pointermove', this.handlePointerMove);
+    this.canvas.addEventListener('pointerup', this.handlePointerUp);
+    this.canvas.addEventListener('pointercancel', this.handlePointerUp);
     void this.loadPlayData();
     this.resize();
   }
@@ -131,6 +146,10 @@ export class FieldRenderer {
     this.canvas.removeEventListener('mousemove', this.handleMouseMove);
     this.canvas.removeEventListener('mouseleave', this.handleMouseLeave);
     this.canvas.removeEventListener('click', this.handleCanvasClick);
+    this.canvas.removeEventListener('pointerdown', this.handlePointerDown);
+    this.canvas.removeEventListener('pointermove', this.handlePointerMove);
+    this.canvas.removeEventListener('pointerup', this.handlePointerUp);
+    this.canvas.removeEventListener('pointercancel', this.handlePointerUp);
   }
 
   resize(): void {
@@ -149,7 +168,9 @@ export class FieldRenderer {
       return;
     }
 
-    const { isPlaying, playTimeSeconds: storeTimeSeconds } = usePlayStore.getState();
+    const { isPlaying, isDrawMode, telestratorResetVersion, playTimeSeconds: storeTimeSeconds } = usePlayStore.getState();
+
+    this.syncTelestratorState(isDrawMode, telestratorResetVersion);
 
     const previousPlayTimeSeconds = this.playTimeSeconds;
 
@@ -194,6 +215,10 @@ export class FieldRenderer {
   };
 
   private handleCanvasClick = (event: MouseEvent): void => {
+    if (usePlayStore.getState().isDrawMode) {
+      return;
+    }
+
     const frame = this.currentFrame;
     if (!frame) {
       return;
@@ -236,6 +261,62 @@ export class FieldRenderer {
     }
 
     this.spotlightPlayerId = selectedOffensive.entityId;
+  };
+
+  private handlePointerDown = (event: PointerEvent): void => {
+    if (!usePlayStore.getState().isDrawMode || event.button !== 0) {
+      return;
+    }
+
+    const point = this.getFieldPointFromClient(event.clientX, event.clientY);
+    if (!point) {
+      return;
+    }
+
+    this.isDrawingTelestratorPath = true;
+    this.telestratorPathYards = [point];
+    this.telestratorDistanceYards = 0;
+    this.telestratorCursorYards = point;
+    this.canvas.setPointerCapture(event.pointerId);
+  };
+
+  private handlePointerMove = (event: PointerEvent): void => {
+    if (!this.isDrawingTelestratorPath) {
+      return;
+    }
+
+    const point = this.getFieldPointFromClient(event.clientX, event.clientY);
+    if (!point) {
+      return;
+    }
+
+    this.telestratorCursorYards = point;
+    const lastPoint = this.telestratorPathYards[this.telestratorPathYards.length - 1];
+    if (!lastPoint) {
+      this.telestratorPathYards.push(point);
+      return;
+    }
+
+    const segmentDistanceYards = Math.hypot(point.x - lastPoint.x, point.y - lastPoint.y);
+    if (segmentDistanceYards < TELESTRATOR_MIN_POINT_DELTA_YARDS) {
+      return;
+    }
+
+    this.telestratorPathYards.push(point);
+    this.telestratorDistanceYards += segmentDistanceYards;
+  };
+
+  private handlePointerUp = (event: PointerEvent): void => {
+    if (!this.isDrawingTelestratorPath) {
+      return;
+    }
+
+    if (this.canvas.hasPointerCapture(event.pointerId)) {
+      this.canvas.releasePointerCapture(event.pointerId);
+    }
+
+    this.isDrawingTelestratorPath = false;
+    this.telestratorCursorYards = null;
   };
 
   private updateDerivedMotionMetrics(frame: InterpolatedFrame, fixedDeltaSeconds: number): void {
@@ -483,6 +564,8 @@ export class FieldRenderer {
 
       ctx.restore();
     }
+
+    this.drawTelestratorOverlay(ctx, xScale, yScale);
 
     this.fpsFrameCount += 1;
     const now = performance.now();
@@ -1010,12 +1093,97 @@ export class FieldRenderer {
     ctx.restore();
   }
 
+  private drawTelestratorOverlay(
+    ctx: CanvasRenderingContext2D,
+    xScale: ReturnType<typeof scaleLinear<number, number>>,
+    yScale: ReturnType<typeof scaleLinear<number, number>>,
+  ): void {
+    if (this.telestratorPathYards.length > 0) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255, 239, 120, 0.92)';
+      ctx.lineWidth = 2.5;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.shadowColor = 'rgba(255, 241, 146, 0.65)';
+      ctx.shadowBlur = 6;
+      ctx.beginPath();
+      ctx.moveTo(xScale(this.telestratorPathYards[0].x), yScale(this.telestratorPathYards[0].y));
+      for (let index = 1; index < this.telestratorPathYards.length; index += 1) {
+        const point = this.telestratorPathYards[index];
+        ctx.lineTo(xScale(point.x), yScale(point.y));
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    if (!this.isDrawingTelestratorPath || !this.telestratorCursorYards) {
+      return;
+    }
+
+    const cursorX = xScale(this.telestratorCursorYards.x);
+    const cursorY = yScale(this.telestratorCursorYards.y);
+    const label = `${this.telestratorDistanceYards.toFixed(1)} yds`;
+    const measured = measureTextBlock(label, '700 12px Inter', 100, 14);
+    const boxWidth = measured.width + 10;
+    const boxHeight = measured.height + 6;
+    const boxX = cursorX + 10;
+    const boxY = cursorY - boxHeight - 12;
+
+    drawRoundedRect(ctx, boxX, boxY, boxWidth, boxHeight, 6);
+    ctx.fillStyle = 'rgba(8, 16, 37, 0.94)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 233, 125, 0.95)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.font = '700 12px Inter';
+    ctx.fillStyle = '#fff6bf';
+    ctx.fillText(label, boxX + 5, boxY + 14);
+  }
+
   private didPlaybackJump(previousTimeSeconds: number, currentTimeSeconds: number, isPlaying: boolean): boolean {
     if (isPlaying) {
       return currentTimeSeconds < previousTimeSeconds;
     }
 
     return Math.abs(currentTimeSeconds - previousTimeSeconds) > GHOST_TRAIL_MIN_SAMPLE_DELTA_SECONDS;
+  }
+
+  private syncTelestratorState(isDrawMode: boolean, resetVersion: number): void {
+    if (resetVersion !== this.lastTelestratorResetVersion) {
+      this.clearTelestrator();
+      this.lastTelestratorResetVersion = resetVersion;
+    }
+
+    if (!isDrawMode && this.isDrawingTelestratorPath) {
+      this.isDrawingTelestratorPath = false;
+      this.telestratorCursorYards = null;
+    }
+  }
+
+  private clearTelestrator(): void {
+    this.isDrawingTelestratorPath = false;
+    this.telestratorPathYards = [];
+    this.telestratorDistanceYards = 0;
+    this.telestratorCursorYards = null;
+  }
+
+  private getFieldPointFromClient(clientX: number, clientY: number): TelestratorPoint | null {
+    const rect = this.canvas.getBoundingClientRect();
+    const pxX = clientX - rect.left;
+    const pxY = clientY - rect.top;
+    const { xScale, yScale } = this.getFieldLayout();
+    const x = xScale.invert(pxX);
+    const y = yScale.invert(pxY);
+
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return null;
+    }
+
+    return {
+      x: Math.max(0, Math.min(FIELD_DIMENSIONS.lengthYards, x)),
+      y: Math.max(0, Math.min(FIELD_DIMENSIONS.widthYards, y)),
+    };
   }
 
   private updateTrails(frame: InterpolatedFrame, playTimeSeconds: number): void {
@@ -1110,6 +1278,8 @@ export class FieldRenderer {
       this.activeFootballEvents.length = 0;
       this.spotlightPlayerId = null;
       this.spotlightDefenderId = null;
+      this.clearTelestrator();
+      this.lastTelestratorResetVersion = usePlayStore.getState().telestratorResetVersion;
       this.clearTrailHistory();
       this.peakVelocityMarkerByPlayer.clear();
       this.buildPeakSpeedTargets(this.playData);
