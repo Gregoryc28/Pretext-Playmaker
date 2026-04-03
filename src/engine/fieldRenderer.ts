@@ -1,4 +1,5 @@
 import { scaleLinear } from 'd3-scale';
+import { polygonArea, polygonCentroid } from 'd3-polygon';
 import { fetchPlayData } from '../data/trackingService';
 import type { FieldDimensions, PlayData, PlayEntitySample } from '../data/types';
 import { placeLabels } from '../physics/labelPlacement';
@@ -21,6 +22,7 @@ const PLAYER_RADIUS_PX = 8;
 const FOOTBALL_RADIUS_PX = 5;
 const YARDS_PER_SECOND_TO_MPH = 2.045;
 const HOVER_DISTANCE_YARDS = 1.25;
+const VORONOI_TEXT_LINE_HEIGHT = 13;
 
 interface ProjectedPlayer extends TeamPoint {
   player: PlayEntitySample;
@@ -258,7 +260,7 @@ export class FieldRenderer {
 
     const placements = placeLabels(labelRequests, obstacles, fieldRect, 4);
 
-    this.drawPitchControl(ctx, projectedPlayers, fieldRect);
+    this.drawPitchControl(ctx, projectedPlayers, fieldRect, xScale, yScale);
     this.drawDefensiveShell(ctx, projectedPlayers);
 
     for (const projectedPlayer of projectedPlayers) {
@@ -393,7 +395,13 @@ export class FieldRenderer {
     return 'In';
   }
 
-  private drawPitchControl(ctx: CanvasRenderingContext2D, players: ProjectedPlayer[], fieldRect: Rect): void {
+  private drawPitchControl(
+    ctx: CanvasRenderingContext2D,
+    players: ProjectedPlayer[],
+    fieldRect: Rect,
+    xScale: ReturnType<typeof scaleLinear<number, number>>,
+    yScale: ReturnType<typeof scaleLinear<number, number>>,
+  ): void {
     const cells = computeVoronoiCells(players, fieldRect);
 
     for (const cell of cells) {
@@ -412,7 +420,52 @@ export class FieldRenderer {
       ctx.strokeStyle = cell.point.team === 'home' ? 'rgba(79, 179, 255, 0.14)' : 'rgba(255, 127, 139, 0.14)';
       ctx.lineWidth = 1;
       ctx.stroke();
+
+      this.drawVoronoiCellTypography(ctx, cell.polygon, xScale, yScale);
     }
+  }
+
+  private drawVoronoiCellTypography(
+    ctx: CanvasRenderingContext2D,
+    polygon: [number, number][],
+    xScale: ReturnType<typeof scaleLinear<number, number>>,
+    yScale: ReturnType<typeof scaleLinear<number, number>>,
+  ): void {
+    const centroid = polygonCentroid(polygon);
+    if (!Number.isFinite(centroid[0]) || !Number.isFinite(centroid[1])) {
+      return;
+    }
+
+    const polygonInYards = polygon.map(([x, y]) => [xScale.invert(x), yScale.invert(y)] as [number, number]);
+    const cellAreaSquareYards = Math.abs(polygonArea(polygonInYards));
+    if (cellAreaSquareYards < 8) {
+      return;
+    }
+
+    const label = `Open Space\n${cellAreaSquareYards.toFixed(1)} sq yds`;
+    const fontSize = Math.max(10, Math.min(14, 10 + cellAreaSquareYards * 0.07));
+    const textBlock = measureTextBlock(label, `600 ${fontSize}px Inter`, 96, VORONOI_TEXT_LINE_HEIGHT);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(polygon[0][0], polygon[0][1]);
+    for (let pointIndex = 1; pointIndex < polygon.length; pointIndex += 1) {
+      ctx.lineTo(polygon[pointIndex][0], polygon[pointIndex][1]);
+    }
+    ctx.closePath();
+    ctx.clip();
+
+    const textX = centroid[0] - textBlock.width / 2;
+    const textY = centroid[1] - textBlock.height / 2;
+    ctx.font = `600 ${fontSize}px Inter`;
+    ctx.fillStyle = 'rgba(235, 244, 255, 0.9)';
+    let lineY = textY + VORONOI_TEXT_LINE_HEIGHT;
+    for (const line of textBlock.lines) {
+      const lineX = textX + (textBlock.width - line.width) / 2;
+      ctx.fillText(line.text, lineX, lineY);
+      lineY += VORONOI_TEXT_LINE_HEIGHT;
+    }
+    ctx.restore();
   }
 
   private drawDefensiveShell(ctx: CanvasRenderingContext2D, players: ProjectedPlayer[]): void {
