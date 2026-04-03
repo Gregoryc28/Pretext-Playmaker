@@ -8,6 +8,7 @@ import { runtimeBus } from './events';
 import { GameLoop } from './gameLoop';
 import { getLoopedPlayTimeSeconds, samplePlayAtTime, type InterpolatedFrame } from './interpolator';
 import { measureTextBlock, type TextMeasureResult } from './pretextAdapter';
+import { usePlayStore } from '../store/usePlayStore';
 
 const FIELD_DIMENSIONS: FieldDimensions = {
   lengthYards: 120,
@@ -53,6 +54,7 @@ export class FieldRenderer {
   private playData: PlayData | null = null;
   private currentFrame: InterpolatedFrame | null = null;
   private playTimeSeconds = 0;
+  private playDurationSeconds = 0;
   private fpsFrameCount = 0;
   private fpsWindowStart = performance.now();
 
@@ -96,9 +98,16 @@ export class FieldRenderer {
       return;
     }
 
-    this.playTimeSeconds += fixedDeltaSeconds;
-    const loopedTime = getLoopedPlayTimeSeconds(this.playData, this.playTimeSeconds);
-    this.currentFrame = samplePlayAtTime(this.playData, loopedTime);
+    const { isPlaying, playTimeSeconds: storeTimeSeconds } = usePlayStore.getState();
+
+    if (isPlaying) {
+      this.playTimeSeconds = getLoopedPlayTimeSeconds(this.playData, this.playTimeSeconds + fixedDeltaSeconds);
+      usePlayStore.setState({ playTimeSeconds: this.playTimeSeconds });
+    } else {
+      this.playTimeSeconds = Math.max(0, Math.min(storeTimeSeconds, this.playDurationSeconds));
+    }
+
+    this.currentFrame = samplePlayAtTime(this.playData, this.playTimeSeconds);
   };
 
   private render = (): void => {
@@ -349,6 +358,15 @@ export class FieldRenderer {
   private async loadPlayData(): Promise<void> {
     try {
       this.playData = await fetchPlayData();
+      const firstTimestamp = this.playData.frames[0].timestampMs;
+      const lastTimestamp = this.playData.frames[this.playData.frames.length - 1].timestampMs;
+      this.playDurationSeconds = Math.max(0, (lastTimestamp - firstTimestamp) / 1000);
+      this.playTimeSeconds = 0;
+
+      usePlayStore.getState().setPlayDuration(this.playDurationSeconds);
+      usePlayStore.getState().setPlayMeta(this.playData.meta);
+      usePlayStore.setState({ playTimeSeconds: 0 });
+
       this.currentFrame = samplePlayAtTime(this.playData, 0);
     } catch (error) {
       console.error('Failed to load sample play data.', error);
